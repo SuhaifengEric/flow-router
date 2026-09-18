@@ -8,6 +8,8 @@
 /server
 /bin/
 /tmp/
+# scripts/build-binary.sh 的产物目录（含前端产物的 Linux 静态二进制）
+/dist-bin/
 /upstream-ops
 /upstream-ops.exe
 /upstream-ops-*.tar
