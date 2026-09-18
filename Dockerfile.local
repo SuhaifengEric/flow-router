@@ -1,0 +1,15 @@
+# 本地修复版镜像：复用 scripts/build-binary.sh 产出的静态二进制。
+#
+# 与仓库根目录 Dockerfile 的运行时阶段保持一致（alpine + ca-certificates + tzdata + wget），
+# 区别只是不再在构建期编译：二进制已含前端产物，且 CGO 关闭，为纯静态文件。
+#
+# 仅用于把本地修复部署到服务器验证；正式发布仍应走仓库 Dockerfile。
+FROM --platform=linux/amd64 alpine:3.20
+
+RUN apk add --no-cache ca-certificates tzdata wget && \
+    mkdir -p /app/data
+
+WORKDIR /app
+COPY dist-bin/flow-router-linux-amd64 /usr/local/bin/upstream-ops
+EXPOSE 8418
+ENTRYPOINT ["upstream-ops"]
