@@ -404,10 +404,84 @@ func TestGetCostsAppliesManualRechargeMultiplier(t *testing.T) {
 	}
 }
 
-func TestGetCostsAppliesUpstreamRechargeMultiplier(t *testing.T) {
+// TestGetCostsFollowsUpstreamDisplayCurrency 覆盖按 quota_display_type 换算今日 / 累计消费。
+func TestGetCostsFollowsUpstreamDisplayCurrency(t *testing.T) {
+	cases := []struct {
+		name       string
+		statusData string
+		wantToday  float64
+		wantTotal  float64
+	}{
+		{
+			name:       "USD 展示按原值，不乘汇率",
+			statusData: `{"quota_per_unit":500000,"quota_display_type":"USD","usd_exchange_rate":7.3}`,
+			wantToday:  2,
+			wantTotal:  10,
+		},
+		{
+			name:       "quota_display_type 缺失时等同 USD",
+			statusData: `{"quota_per_unit":500000}`,
+			wantToday:  2,
+			wantTotal:  10,
+		},
+		{
+			name:       "CNY 展示乘 usd_exchange_rate",
+			statusData: `{"quota_per_unit":500000,"quota_display_type":"CNY","usd_exchange_rate":7.2}`,
+			wantToday:  14.4,
+			wantTotal:  72,
+		},
+		{
+			name:       "CUSTOM 展示乘自定义汇率",
+			statusData: `{"quota_per_unit":500000,"quota_display_type":"CUSTOM","custom_currency_exchange_rate":2}`,
+			wantToday:  4,
+			wantTotal:  20,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(`{"success":true,"message":"","data":` + tc.statusData + `}`))
+			})
+			mux.HandleFunc("/api/log/self/stat", func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(`{"success":true,"message":"","data":{"quota":1000000}}`))
+			})
+			mux.HandleFunc("/api/user/self", func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(`{"success":true,"message":"","data":{"used_quota":5000000}}`))
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			c := New()
+			res, err := c.GetCosts(context.Background(), &connector.Channel{
+				SiteURL:                srv.URL,
+				RechargeMultiplierMode: connector.RechargeMultiplierModeDivide,
+			}, &connector.AuthSession{
+				Cookie: "session=1",
+				UserID: "7",
+			})
+			if err != nil {
+				t.Fatalf("GetCosts: %v", err)
+			}
+			if res.TodayCost != tc.wantToday {
+				t.Fatalf("today cost = %v, want %v", res.TodayCost, tc.wantToday)
+			}
+			if res.TotalCost != tc.wantTotal {
+				t.Fatalf("total cost = %v, want %v", res.TotalCost, tc.wantTotal)
+			}
+		})
+	}
+}
+
+// TestGetCostsIgnoresUpstreamPrice 是回归测试。
+//
+// price 是「充值价格」（购买 1 美元额度需支付多少货币），只与充值页有关，
+// 不参与额度换算。早先误把它当成换算倍率，会让 price ≠ 1 的站点
+// （如 price=7.3）的余额与消费被整体放大 7.3 倍。
+func TestGetCostsIgnoresUpstreamPrice(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"success":true,"message":"","data":{"quota_per_unit":500000,"price":7.2}}`))
+		_, _ = w.Write([]byte(`{"success":true,"message":"","data":{"quota_per_unit":500000,"quota_display_type":"USD","usd_exchange_rate":7.3,"price":7.3}}`))
 	})
 	mux.HandleFunc("/api/log/self/stat", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"success":true,"message":"","data":{"quota":1000000}}`))
@@ -429,11 +503,59 @@ func TestGetCostsAppliesUpstreamRechargeMultiplier(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetCosts: %v", err)
 	}
-	if res.TodayCost != 14.4 {
-		t.Fatalf("today cost = %v, want 14.4", res.TodayCost)
+	if res.TodayCost != 2 {
+		t.Fatalf("today cost = %v, want 2 (price 不得参与换算)", res.TodayCost)
 	}
-	if res.TotalCost != 72 {
-		t.Fatalf("total cost = %v, want 72", res.TotalCost)
+	if res.TotalCost != 10 {
+		t.Fatalf("total cost = %v, want 10 (price 不得参与换算)", res.TotalCost)
+	}
+}
+
+// TestGetBalanceFollowsUpstreamDisplayCurrency 覆盖余额侧的同类换算。
+func TestGetBalanceFollowsUpstreamDisplayCurrency(t *testing.T) {
+	cases := []struct {
+		name       string
+		statusData string
+		want       float64
+	}{
+		{
+			name:       "USD 展示不受 price 影响",
+			statusData: `{"quota_per_unit":500000,"quota_display_type":"USD","usd_exchange_rate":7.3,"price":7.3}`,
+			want:       2,
+		},
+		{
+			name:       "CNY 展示乘 usd_exchange_rate",
+			statusData: `{"quota_per_unit":500000,"quota_display_type":"CNY","usd_exchange_rate":2}`,
+			want:       4,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(`{"success":true,"message":"","data":` + tc.statusData + `}`))
+			})
+			mux.HandleFunc("/api/user/self", func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(`{"success":true,"message":"","data":{"quota":1000000}}`))
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			c := New()
+			res, err := c.GetBalance(context.Background(), &connector.Channel{
+				SiteURL:                srv.URL,
+				RechargeMultiplierMode: connector.RechargeMultiplierModeDivide,
+			}, &connector.AuthSession{
+				Cookie: "session=1",
+				UserID: "7",
+			})
+			if err != nil {
+				t.Fatalf("GetBalance: %v", err)
+			}
+			if res.Balance != tc.want {
+				t.Fatalf("balance = %v, want %v", res.Balance, tc.want)
+			}
+		})
 	}
 }
 

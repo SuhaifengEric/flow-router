@@ -303,19 +303,9 @@ func applyNewAPIAuth(req *resty.Request, session *connector.AuthSession) {
 
 func (c *Client) GetBalance(ctx context.Context, ch *connector.Channel, session *connector.AuthSession) (*connector.BalanceResult, error) {
 	site := strings.TrimRight(ch.SiteURL, "/")
-	statusBody, err := c.getJSON(ctx, site+"/api/status", nil)
+	status, err := c.fetchStatus(ctx, site)
 	if err != nil {
-		return nil, fmt.Errorf("newapi status: %w", err)
-	}
-	var status struct {
-		QuotaPerUnit float64 `json:"quota_per_unit"`
-		Price        float64 `json:"price"`
-	}
-	if err := json.Unmarshal(statusBody, &status); err != nil {
-		return nil, fmt.Errorf("newapi status decode: %w", err)
-	}
-	if status.QuotaPerUnit <= 0 {
-		status.QuotaPerUnit = 500000
+		return nil, err
 	}
 
 	selfBody, err := c.getJSON(ctx, site+"/api/user/self", session)
@@ -328,8 +318,8 @@ func (c *Client) GetBalance(ctx context.Context, ch *connector.Channel, session 
 	if err := json.Unmarshal(selfBody, &self); err != nil {
 		return nil, fmt.Errorf("newapi self decode: %w", err)
 	}
-	balance := c.quotaToUSD(self.Quota, status.QuotaPerUnit)
-	multiplier := newAPIRechargeMultiplier(ch, status.Price)
+	balance := c.quotaToUSD(self.Quota, status.quotaPerUnit())
+	multiplier := newAPIRechargeMultiplier(ch, status)
 	return &connector.BalanceResult{
 		Balance:   connector.ApplyRechargeMultiplier(balance, multiplier, ch.RechargeMultiplierMode),
 		SampledAt: time.Now(),
@@ -338,19 +328,9 @@ func (c *Client) GetBalance(ctx context.Context, ch *connector.Channel, session 
 
 func (c *Client) GetCosts(ctx context.Context, ch *connector.Channel, session *connector.AuthSession) (*connector.CostResult, error) {
 	site := strings.TrimRight(ch.SiteURL, "/")
-	statusBody, err := c.getJSON(ctx, site+"/api/status", nil)
+	status, err := c.fetchStatus(ctx, site)
 	if err != nil {
-		return nil, fmt.Errorf("newapi status: %w", err)
-	}
-	var status struct {
-		QuotaPerUnit float64 `json:"quota_per_unit"`
-		Price        float64 `json:"price"`
-	}
-	if err := json.Unmarshal(statusBody, &status); err != nil {
-		return nil, fmt.Errorf("newapi status decode: %w", err)
-	}
-	if status.QuotaPerUnit <= 0 {
-		status.QuotaPerUnit = 500000
+		return nil, err
 	}
 
 	now := time.Now()
@@ -378,9 +358,10 @@ func (c *Client) GetCosts(ctx context.Context, ch *connector.Channel, session *c
 		return nil, fmt.Errorf("newapi self total decode: %w", err)
 	}
 
-	todayCost := c.quotaToUSD(todayStat.Quota, status.QuotaPerUnit)
-	totalCost := c.quotaToUSD(usage.UsedQuota, status.QuotaPerUnit)
-	multiplier := newAPIRechargeMultiplier(ch, status.Price)
+	unit := status.quotaPerUnit()
+	todayCost := c.quotaToUSD(todayStat.Quota, unit)
+	totalCost := c.quotaToUSD(usage.UsedQuota, unit)
+	multiplier := newAPIRechargeMultiplier(ch, status)
 	return &connector.CostResult{
 		TodayCost: connector.ApplyRechargeMultiplier(todayCost, multiplier, ch.RechargeMultiplierMode),
 		TotalCost: connector.ApplyRechargeMultiplier(totalCost, multiplier, ch.RechargeMultiplierMode),
@@ -473,19 +454,9 @@ func (c *Client) GetAnnouncements(ctx context.Context, ch *connector.Channel, se
 
 func (c *Client) RedeemCode(ctx context.Context, ch *connector.Channel, session *connector.AuthSession, code string) (*connector.RedeemResult, error) {
 	site := strings.TrimRight(ch.SiteURL, "/")
-	statusBody, err := c.getJSON(ctx, site+"/api/status", nil)
+	status, err := c.fetchStatus(ctx, site)
 	if err != nil {
-		return nil, fmt.Errorf("newapi status: %w", err)
-	}
-	var status struct {
-		QuotaPerUnit float64 `json:"quota_per_unit"`
-		Price        float64 `json:"price"`
-	}
-	if err := json.Unmarshal(statusBody, &status); err != nil {
-		return nil, fmt.Errorf("newapi status decode: %w", err)
-	}
-	if status.QuotaPerUnit <= 0 {
-		status.QuotaPerUnit = 500000
+		return nil, err
 	}
 
 	req := c.http.R().
@@ -512,8 +483,8 @@ func (c *Client) RedeemCode(ctx context.Context, ch *connector.Channel, session 
 	if err := json.Unmarshal(wrapped.Data, &quota); err != nil {
 		return nil, fmt.Errorf("newapi redeem data: %w", err)
 	}
-	value := quota / status.QuotaPerUnit
-	multiplier := newAPIRechargeMultiplier(ch, status.Price)
+	value := quota / status.quotaPerUnit()
+	multiplier := newAPIRechargeMultiplier(ch, status)
 	return &connector.RedeemResult{
 		Message: "兑换成功",
 		Type:    "balance",
@@ -1050,14 +1021,84 @@ func (c *Client) quotaToUSD(quota float64, quotaPerUnit float64) float64 {
 	return round4(quota / quotaPerUnit)
 }
 
-func newAPIRechargeMultiplier(ch *connector.Channel, price float64) *float64 {
+// DefaultQuotaPerUnit NewAPI 默认的「每 1 货币单位对应多少 quota」。站点未下发时使用。
+const DefaultQuotaPerUnit = 500000
+
+// 站点额度展示类型，对应 /api/status 的 quota_display_type。
+const (
+	quotaDisplayTypeUSD    = "USD"
+	quotaDisplayTypeCNY    = "CNY"
+	quotaDisplayTypeCustom = "CUSTOM"
+)
+
+// newAPIStatus /api/status 中与额度展示、换算相关的站点设置。
+//
+// 这里有两个容易混淆的字段，务必区分：
+//   - QuotaDisplayType 配合 USDExchangeRate / CustomCurrencyExchangeRate，
+//     决定「额度以哪种货币展示」，是换算余额与消费的依据；
+//   - Price 是「充值价格」，表示购买 1 美元额度需要支付多少货币，
+//     只与充值页展示有关，不能用来换算余额。
+type newAPIStatus struct {
+	QuotaPerUnit               float64 `json:"quota_per_unit"`
+	QuotaDisplayType           string  `json:"quota_display_type"`
+	USDExchangeRate            float64 `json:"usd_exchange_rate"`
+	CustomCurrencyExchangeRate float64 `json:"custom_currency_exchange_rate"`
+}
+
+// quotaPerUnit 返回有效的 quota 换算基数。
+func (s newAPIStatus) quotaPerUnit() float64 {
+	if s.QuotaPerUnit > 0 {
+		return s.QuotaPerUnit
+	}
+	return DefaultQuotaPerUnit
+}
+
+// displayExchangeRate 返回把额度换算成站点展示货币所需的汇率。
+//
+// 站点按美元展示（quota_display_type 为 USD 或缺失）时返回 0，表示无需换算。
+func (s newAPIStatus) displayExchangeRate() float64 {
+	switch strings.ToUpper(strings.TrimSpace(s.QuotaDisplayType)) {
+	case quotaDisplayTypeCNY:
+		if s.USDExchangeRate > 0 {
+			return s.USDExchangeRate
+		}
+	case quotaDisplayTypeCustom:
+		if s.CustomCurrencyExchangeRate > 0 {
+			return s.CustomCurrencyExchangeRate
+		}
+	}
+	return 0
+}
+
+// fetchStatus 拉取并解析站点的 /api/status。
+func (c *Client) fetchStatus(ctx context.Context, site string) (newAPIStatus, error) {
+	body, err := c.getJSON(ctx, site+"/api/status", nil)
+	if err != nil {
+		return newAPIStatus{}, fmt.Errorf("newapi status: %w", err)
+	}
+	var status newAPIStatus
+	if err := json.Unmarshal(body, &status); err != nil {
+		return newAPIStatus{}, fmt.Errorf("newapi status decode: %w", err)
+	}
+	return status, nil
+}
+
+// newAPIRechargeMultiplier 解析余额 / 消费的换算倍率。
+//
+// 渠道上手动配置的倍率优先；未配置时跟随上游，按站点展示货币相对美元的汇率换算。
+// 站点按美元展示时不做任何换算。
+//
+// 注意：这里不能使用 /api/status 的 price。price 是「充值价格」，与额度展示无关；
+// 早先误用它会把 price ≠ 1 的站点（例如 price=7.3）余额与消费整体放大 7.3 倍。
+func newAPIRechargeMultiplier(ch *connector.Channel, status newAPIStatus) *float64 {
 	if ch.RechargeMultiplier != nil && *ch.RechargeMultiplier > 0 {
 		return ch.RechargeMultiplier
 	}
-	if price <= 0 {
+	rate := status.displayExchangeRate()
+	if rate <= 0 {
 		return nil
 	}
-	multiplier := 1 / price
+	multiplier := 1 / rate
 	return &multiplier
 }
 
